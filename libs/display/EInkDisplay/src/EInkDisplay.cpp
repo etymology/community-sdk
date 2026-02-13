@@ -447,6 +447,14 @@ void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
   while (!pollRefreshComplete()) {
     delay(1);
   }
+  // Guard against state desync: even if refreshInProgress is false, never write RAM while panel BUSY is high.
+  if (isBusy()) {
+    waitWhileBusy(" pre-displayBuffer busy");
+    if (isBusy()) {
+      if (Serial) Serial.printf("[%lu]   ERROR: Panel still busy before displayBuffer\n", millis());
+      return;
+    }
+  }
 
   if (!isScreenOn && !turnOffScreen)
   {
