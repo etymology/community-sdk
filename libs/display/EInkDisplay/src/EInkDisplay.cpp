@@ -444,6 +444,10 @@ void EInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
 #endif
 
 void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
+  while (!pollRefreshComplete()) {
+    delay(1);
+  }
+
   if (!isScreenOn && !turnOffScreen)
   {
     // Force half refresh if screen is off
@@ -676,6 +680,10 @@ bool EInkDisplay::displayWindowAsync(uint16_t x, uint16_t y, uint16_t w, uint16_
 }
 
 void EInkDisplay::displayGrayBuffer(const bool turnOffScreen) {
+  while (!pollRefreshComplete()) {
+    delay(1);
+  }
+
   drawGrayscale = false;
   inGrayscaleMode = true;
 
@@ -816,6 +824,10 @@ void EInkDisplay::setCustomLUT(const bool enabled, const unsigned char* lutData)
 }
 
 void EInkDisplay::deepSleep() {
+  while (!pollRefreshComplete()) {
+    delay(1);
+  }
+
   if (Serial) Serial.printf("[%lu]   Preparing display for deep sleep...\n", millis());
 
   // First, power down the display properly
