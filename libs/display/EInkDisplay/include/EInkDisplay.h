@@ -91,12 +91,20 @@ class EInkDisplay {
   bool inGrayscaleMode;
   bool drawGrayscale;
   bool refreshInProgress;
+  bool ramDataEntryConfigured;
+  bool ramAreaConfigured;
+  uint16_t ramAreaX;
+  uint16_t ramAreaY;
+  uint16_t ramAreaW;
+  uint16_t ramAreaH;
 
   // Low-level display control
   void resetDisplay();
   void sendCommand(uint8_t command);
   void sendData(uint8_t data);
   void sendData(const uint8_t* data, uint32_t length);
+  void sendCommandData(uint8_t command, uint8_t data);
+  void sendCommandData(uint8_t command, const uint8_t* data, uint32_t length);
   void waitWhileBusy(const char* comment = nullptr);
   void initDisplayController();
 

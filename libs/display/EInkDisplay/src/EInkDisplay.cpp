@@ -122,7 +122,13 @@ EInkDisplay::EInkDisplay(int8_t sclk, int8_t mosi, int8_t cs, int8_t dc, int8_t 
       customLutActive(false),
       inGrayscaleMode(false),
       drawGrayscale(false),
-      refreshInProgress(false) {
+      refreshInProgress(false),
+      ramDataEntryConfigured(false),
+      ramAreaConfigured(false),
+      ramAreaX(0),
+      ramAreaY(0),
+      ramAreaW(0),
+      ramAreaH(0) {
   if (Serial) Serial.printf("[%lu] EInkDisplay: Constructor called\n", millis());
   if (Serial) Serial.printf("[%lu]   SCLK=%d, MOSI=%d, CS=%d, DC=%d, RST=%d, BUSY=%d\n", millis(), sclk, mosi, cs, dc, rst, busy);
 }
@@ -134,6 +140,8 @@ void EInkDisplay::begin() {
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
   frameBufferActive = frameBuffer1;
 #endif
+  ramDataEntryConfigured = false;
+  ramAreaConfigured = false;
 
   // Initialize to white
   memset(frameBuffer0, 0xFF, BUFFER_SIZE);
@@ -213,6 +221,38 @@ void EInkDisplay::sendData(const uint8_t* data, uint32_t length) {
   SPI.endTransaction();
 }
 
+void EInkDisplay::sendCommandData(uint8_t command, uint8_t data) {
+#ifdef EINK_DISPLAY_FORCE_BASELINE
+  sendCommand(command);
+  sendData(data);
+  return;
+#endif
+  SPI.beginTransaction(spiSettings);
+  digitalWrite(_dc, LOW);   // Command mode
+  digitalWrite(_cs, LOW);   // Select chip
+  SPI.transfer(command);
+  digitalWrite(_dc, HIGH);  // Data mode
+  SPI.transfer(data);
+  digitalWrite(_cs, HIGH);  // Deselect chip
+  SPI.endTransaction();
+}
+
+void EInkDisplay::sendCommandData(uint8_t command, const uint8_t* data, uint32_t length) {
+#ifdef EINK_DISPLAY_FORCE_BASELINE
+  sendCommand(command);
+  sendData(data, length);
+  return;
+#endif
+  SPI.beginTransaction(spiSettings);
+  digitalWrite(_dc, LOW);   // Command mode
+  digitalWrite(_cs, LOW);   // Select chip
+  SPI.transfer(command);
+  digitalWrite(_dc, HIGH);  // Data mode
+  SPI.writeBytes(data, length);
+  digitalWrite(_cs, HIGH);  // Deselect chip
+  SPI.endTransaction();
+}
+
 void EInkDisplay::waitWhileBusy(const char* comment) {
   unsigned long start = millis();
   while (digitalRead(_busy) == HIGH) {
@@ -237,35 +277,29 @@ void EInkDisplay::initDisplayController() {
   waitWhileBusy(" CMD_SOFT_RESET");
 
   // Temperature sensor control (internal)
-  sendCommand(CMD_TEMP_SENSOR_CONTROL);
-  sendData(TEMP_SENSOR_INTERNAL);
+  sendCommandData(CMD_TEMP_SENSOR_CONTROL, TEMP_SENSOR_INTERNAL);
 
   // Booster soft-start control (GDEQ0426T82 specific values)
   const uint8_t boosterSoftStart[] = {0xAE, 0xC7, 0xC3, 0xC0, 0x40};
-  sendCommand(CMD_BOOSTER_SOFT_START);
-  sendData(boosterSoftStart, sizeof(boosterSoftStart));
+  sendCommandData(CMD_BOOSTER_SOFT_START, boosterSoftStart, sizeof(boosterSoftStart));
 
   // Driver output control: set display height (480) and scan direction
   const uint16_t HEIGHT = 480;
   const uint8_t driverOutput[] = {
       static_cast<uint8_t>((HEIGHT - 1) & 0xFF), static_cast<uint8_t>((HEIGHT - 1) >> 8), 0x02};
-  sendCommand(CMD_DRIVER_OUTPUT_CONTROL);
-  sendData(driverOutput, sizeof(driverOutput));
+  sendCommandData(CMD_DRIVER_OUTPUT_CONTROL, driverOutput, sizeof(driverOutput));
 
   // Border waveform control
-  sendCommand(CMD_BORDER_WAVEFORM);
-  sendData(0x01);
+  sendCommandData(CMD_BORDER_WAVEFORM, 0x01);
 
   // Set up full screen RAM area
   setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 
   if (Serial) Serial.printf("[%lu]   Clearing RAM buffers...\n", millis());
-  sendCommand(CMD_AUTO_WRITE_BW_RAM);  // Auto write BW RAM
-  sendData(0xF7);
+  sendCommandData(CMD_AUTO_WRITE_BW_RAM, 0xF7);  // Auto write BW RAM
   waitWhileBusy(" CMD_AUTO_WRITE_BW_RAM");
 
-  sendCommand(CMD_AUTO_WRITE_RED_RAM);  // Auto write RED RAM
-  sendData(0xF7);                       // Fill with white pattern
+  sendCommandData(CMD_AUTO_WRITE_RED_RAM, 0xF7);  // Fill with white pattern
   waitWhileBusy(" CMD_AUTO_WRITE_RED_RAM");
 
   if (Serial) Serial.printf("[%lu]   SSD1677 controller initialized\n", millis());
@@ -273,37 +307,75 @@ void EInkDisplay::initDisplayController() {
 
 void EInkDisplay::setRamArea(const uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
   constexpr uint8_t DATA_ENTRY_X_INC_Y_DEC = 0x01;
+  if (w == 0 || h == 0) {
+    return;
+  }
 
-  // Reverse Y coordinate (gates are reversed on this display)
-  y = DISPLAY_HEIGHT - y - h;
+#ifdef EINK_DISPLAY_FORCE_BASELINE
+  // Baseline path: always rewrite data-entry mode, ranges and counters.
+  const uint16_t yReversed = DISPLAY_HEIGHT - y - h;
   const uint16_t xEnd = x + w - 1;
-  const uint16_t yStart = y + h - 1;
-  const uint8_t ramXRange[] = {
-      static_cast<uint8_t>(x & 0xFF), static_cast<uint8_t>(x >> 8), static_cast<uint8_t>(xEnd & 0xFF), static_cast<uint8_t>(xEnd >> 8)};
-  const uint8_t ramYRange[] = {
-      static_cast<uint8_t>(yStart & 0xFF), static_cast<uint8_t>(yStart >> 8), static_cast<uint8_t>(y & 0xFF), static_cast<uint8_t>(y >> 8)};
+  const uint16_t yStart = yReversed + h - 1;
+  const uint8_t ramXRange[] = {static_cast<uint8_t>(x & 0xFF), static_cast<uint8_t>(x >> 8),
+                               static_cast<uint8_t>(xEnd & 0xFF), static_cast<uint8_t>(xEnd >> 8)};
+  const uint8_t ramYRange[] = {static_cast<uint8_t>(yStart & 0xFF), static_cast<uint8_t>(yStart >> 8),
+                               static_cast<uint8_t>(yReversed & 0xFF), static_cast<uint8_t>(yReversed >> 8)};
   const uint8_t ramXCounter[] = {static_cast<uint8_t>(x & 0xFF), static_cast<uint8_t>(x >> 8)};
   const uint8_t ramYCounter[] = {static_cast<uint8_t>(yStart & 0xFF), static_cast<uint8_t>(yStart >> 8)};
 
-  // Set data entry mode (X increment, Y decrement for reversed gates)
   sendCommand(CMD_DATA_ENTRY_MODE);
   sendData(DATA_ENTRY_X_INC_Y_DEC);
 
-  // Set RAM X address range (start, end) - X is in PIXELS
   sendCommand(CMD_SET_RAM_X_RANGE);
   sendData(ramXRange, sizeof(ramXRange));
 
-  // Set RAM Y address range (start, end) - Y is in PIXELS
   sendCommand(CMD_SET_RAM_Y_RANGE);
   sendData(ramYRange, sizeof(ramYRange));
 
-  // Set RAM X address counter - X is in PIXELS
   sendCommand(CMD_SET_RAM_X_COUNTER);
   sendData(ramXCounter, sizeof(ramXCounter));
 
-  // Set RAM Y address counter - Y is in PIXELS
   sendCommand(CMD_SET_RAM_Y_COUNTER);
   sendData(ramYCounter, sizeof(ramYCounter));
+  return;
+#else
+  // Reverse Y coordinate (gates are reversed on this display)
+  const uint16_t yReversed = DISPLAY_HEIGHT - y - h;
+  const uint16_t xEnd = x + w - 1;
+  const uint16_t yStart = yReversed + h - 1;
+  const uint8_t ramXCounter[] = {static_cast<uint8_t>(x & 0xFF), static_cast<uint8_t>(x >> 8)};
+  const uint8_t ramYCounter[] = {static_cast<uint8_t>(yStart & 0xFF), static_cast<uint8_t>(yStart >> 8)};
+  const bool windowChanged = !ramAreaConfigured || x != ramAreaX || y != ramAreaY || w != ramAreaW || h != ramAreaH;
+
+  if (!ramDataEntryConfigured) {
+    // Set data entry mode (X increment, Y decrement for reversed gates)
+    sendCommandData(CMD_DATA_ENTRY_MODE, DATA_ENTRY_X_INC_Y_DEC);
+    ramDataEntryConfigured = true;
+  }
+
+  if (windowChanged) {
+    const uint8_t ramXRange[] = {static_cast<uint8_t>(x & 0xFF), static_cast<uint8_t>(x >> 8),
+                                 static_cast<uint8_t>(xEnd & 0xFF), static_cast<uint8_t>(xEnd >> 8)};
+    const uint8_t ramYRange[] = {static_cast<uint8_t>(yStart & 0xFF), static_cast<uint8_t>(yStart >> 8),
+                                 static_cast<uint8_t>(yReversed & 0xFF), static_cast<uint8_t>(yReversed >> 8)};
+
+    // Set RAM X/Y address range only when window changes.
+    sendCommandData(CMD_SET_RAM_X_RANGE, ramXRange, sizeof(ramXRange));
+    sendCommandData(CMD_SET_RAM_Y_RANGE, ramYRange, sizeof(ramYRange));
+
+    ramAreaConfigured = true;
+    ramAreaX = x;
+    ramAreaY = y;
+    ramAreaW = w;
+    ramAreaH = h;
+  }
+
+  // Set RAM X address counter - X is in PIXELS
+  sendCommandData(CMD_SET_RAM_X_COUNTER, ramXCounter, sizeof(ramXCounter));
+
+  // Set RAM Y address counter - Y is in PIXELS
+  sendCommandData(CMD_SET_RAM_Y_COUNTER, ramYCounter, sizeof(ramYCounter));
+#endif
 }
 
 void EInkDisplay::clearScreen(const uint8_t color) const {
@@ -362,7 +434,8 @@ void EInkDisplay::drawImageTransparent(const uint8_t* imageData, const uint16_t 
   const uint16_t rowsToCopy = (y + h > DISPLAY_HEIGHT) ? (DISPLAY_HEIGHT - y) : h;
   const uint16_t colsToCopy = (xByte + imageWidthBytes > DISPLAY_WIDTH_BYTES) ? (DISPLAY_WIDTH_BYTES - xByte) : imageWidthBytes;
 
-  // Copy only black pixels to frame buffer
+#ifdef EINK_DISPLAY_FORCE_BASELINE
+  // Baseline path: branch on fromProgmem inside the hot loop.
   for (uint16_t row = 0; row < rowsToCopy; row++) {
     const uint16_t destOffset = (y + row) * DISPLAY_WIDTH_BYTES + xByte;
     const uint16_t srcOffset = row * imageWidthBytes;
@@ -374,6 +447,32 @@ void EInkDisplay::drawImageTransparent(const uint8_t* imageData, const uint16_t 
       dest[col] &= srcByte;
     }
   }
+#else
+  // Optimized path: hoist fromProgmem branch out of the inner loop.
+  if (!fromProgmem) {
+    for (uint16_t row = 0; row < rowsToCopy; row++) {
+      const uint16_t destOffset = (y + row) * DISPLAY_WIDTH_BYTES + xByte;
+      const uint16_t srcOffset = row * imageWidthBytes;
+      uint8_t* dest = &frameBuffer[destOffset];
+      const uint8_t* src = &imageData[srcOffset];
+
+      for (uint16_t col = 0; col < colsToCopy; col++) {
+        dest[col] &= src[col];
+      }
+    }
+  } else {
+    for (uint16_t row = 0; row < rowsToCopy; row++) {
+      const uint16_t destOffset = (y + row) * DISPLAY_WIDTH_BYTES + xByte;
+      const uint16_t srcOffset = row * imageWidthBytes;
+      uint8_t* dest = &frameBuffer[destOffset];
+      const uint8_t* src = &imageData[srcOffset];
+
+      for (uint16_t col = 0; col < colsToCopy; col++) {
+        dest[col] &= pgm_read_byte(&src[col]);
+      }
+    }
+  }
+#endif
 
   if (Serial) Serial.printf("[%lu]   Transparent image drawn to frame buffer\n", millis());
 }
@@ -383,8 +482,7 @@ void EInkDisplay::writeRamBuffer(uint8_t ramBuffer, const uint8_t* data, uint32_
   const unsigned long startTime = millis();
   if (Serial) Serial.printf("[%lu]   Writing frame buffer to %s RAM (%lu bytes)...\n", startTime, bufferName, size);
 
-  sendCommand(ramBuffer);
-  sendData(data, size);
+  sendCommandData(ramBuffer, data, size);
 
   const unsigned long duration = millis() - startTime;
   if (Serial) Serial.printf("[%lu]   %s RAM write complete (%lu ms)\n", millis(), bufferName, duration);
@@ -676,8 +774,7 @@ bool EInkDisplay::refreshDisplayAsync(const RefreshMode mode, const bool turnOff
   }
 
   // Configure Display Update Control 1
-  sendCommand(CMD_DISPLAY_UPDATE_CTRL1);
-  sendData((mode == FAST_REFRESH) ? CTRL1_NORMAL : CTRL1_BYPASS_RED);  // Configure buffer comparison mode
+  sendCommandData(CMD_DISPLAY_UPDATE_CTRL1, (mode == FAST_REFRESH) ? CTRL1_NORMAL : CTRL1_BYPASS_RED);
 
   // best guess at display mode bits:
   // bit | hex | name                    | effect
@@ -710,8 +807,7 @@ bool EInkDisplay::refreshDisplayAsync(const RefreshMode mode, const bool turnOff
     displayMode |= 0x34;
   } else if (mode == HALF_REFRESH) {
     // Write high temp to the register for a faster refresh
-    sendCommand(CMD_WRITE_TEMP);
-    sendData(0x5A);
+    sendCommandData(CMD_WRITE_TEMP, 0x5A);
     displayMode |= 0xD4;
   } else {  // FAST_REFRESH
     displayMode |= customLutActive ? 0x0C : 0x1C;
@@ -720,8 +816,7 @@ bool EInkDisplay::refreshDisplayAsync(const RefreshMode mode, const bool turnOff
   // Power on and refresh display
   const char* refreshType = (mode == FULL_REFRESH) ? "full" : (mode == HALF_REFRESH) ? "half" : "fast";
   if (Serial) Serial.printf("[%lu]   Powering on display 0x%02X (%s refresh)...\n", millis(), displayMode, refreshType);
-  sendCommand(CMD_DISPLAY_UPDATE_CTRL2);
-  sendData(displayMode);
+  sendCommandData(CMD_DISPLAY_UPDATE_CTRL2, displayMode);
 
   sendCommand(CMD_MASTER_ACTIVATION);
   refreshInProgress = true;
@@ -738,20 +833,16 @@ void EInkDisplay::setCustomLUT(const bool enabled, const unsigned char* lutData)
     }
 
     // Load custom LUT (first 105 bytes: VS + TP/RP + frame rate)
-    sendCommand(CMD_WRITE_LUT);
-    sendData(lutWaveform, sizeof(lutWaveform));
+    sendCommandData(CMD_WRITE_LUT, lutWaveform, sizeof(lutWaveform));
 
     // Set voltage values from bytes 105-109
-    sendCommand(CMD_GATE_VOLTAGE);  // VGH
-    sendData(pgm_read_byte(&lutData[105]));
+    sendCommandData(CMD_GATE_VOLTAGE, pgm_read_byte(&lutData[105]));  // VGH
 
     const uint8_t sourceVoltages[] = {
         pgm_read_byte(&lutData[106]), pgm_read_byte(&lutData[107]), pgm_read_byte(&lutData[108])};
-    sendCommand(CMD_SOURCE_VOLTAGE);         // VSH1, VSH2, VSL
-    sendData(sourceVoltages, sizeof(sourceVoltages));
+    sendCommandData(CMD_SOURCE_VOLTAGE, sourceVoltages, sizeof(sourceVoltages));  // VSH1, VSH2, VSL
 
-    sendCommand(CMD_WRITE_VCOM);  // VCOM
-    sendData(pgm_read_byte(&lutData[109]));
+    sendCommandData(CMD_WRITE_VCOM, pgm_read_byte(&lutData[109]));  // VCOM
 
     customLutActive = true;
     if (Serial) Serial.printf("[%lu]   Custom LUT loaded\n", millis());
@@ -771,11 +862,8 @@ void EInkDisplay::deepSleep() {
   // First, power down the display properly
   // This shuts down the analog power rails and clock
   if (isScreenOn) {
-    sendCommand(CMD_DISPLAY_UPDATE_CTRL1);
-    sendData(CTRL1_BYPASS_RED);  // Normal mode
-
-    sendCommand(CMD_DISPLAY_UPDATE_CTRL2);
-    sendData(0x03);  // Set ANALOG_OFF_PHASE (bit 1) and CLOCK_OFF (bit 0)
+    sendCommandData(CMD_DISPLAY_UPDATE_CTRL1, CTRL1_BYPASS_RED);  // Normal mode
+    sendCommandData(CMD_DISPLAY_UPDATE_CTRL2, 0x03);              // ANALOG_OFF_PHASE and CLOCK_OFF
 
     sendCommand(CMD_MASTER_ACTIVATION);
 
@@ -787,8 +875,9 @@ void EInkDisplay::deepSleep() {
 
   // Now enter deep sleep mode
   if (Serial) Serial.printf("[%lu]   Entering deep sleep mode...\n", millis());
-  sendCommand(CMD_DEEP_SLEEP);
-  sendData(0x01);  // Enter deep sleep
+  sendCommandData(CMD_DEEP_SLEEP, 0x01);  // Enter deep sleep
+  ramDataEntryConfigured = false;
+  ramAreaConfigured = false;
 }
 
 void EInkDisplay::saveFrameBufferAsPBM(const char* filename) {
