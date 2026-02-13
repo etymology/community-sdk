@@ -200,7 +200,7 @@ void EInkDisplay::sendData(uint8_t data) {
   SPI.endTransaction();
 }
 
-void EInkDisplay::sendData(const uint8_t* data, uint16_t length) {
+void EInkDisplay::sendData(const uint8_t* data, uint32_t length) {
   SPI.beginTransaction(spiSettings);
   digitalWrite(_dc, HIGH);       // Data mode
   digitalWrite(_cs, LOW);        // Select chip
@@ -237,19 +237,16 @@ void EInkDisplay::initDisplayController() {
   sendData(TEMP_SENSOR_INTERNAL);
 
   // Booster soft-start control (GDEQ0426T82 specific values)
+  const uint8_t boosterSoftStart[] = {0xAE, 0xC7, 0xC3, 0xC0, 0x40};
   sendCommand(CMD_BOOSTER_SOFT_START);
-  sendData(0xAE);
-  sendData(0xC7);
-  sendData(0xC3);
-  sendData(0xC0);
-  sendData(0x40);
+  sendData(boosterSoftStart, sizeof(boosterSoftStart));
 
   // Driver output control: set display height (480) and scan direction
   const uint16_t HEIGHT = 480;
+  const uint8_t driverOutput[] = {
+      static_cast<uint8_t>((HEIGHT - 1) & 0xFF), static_cast<uint8_t>((HEIGHT - 1) >> 8), 0x02};
   sendCommand(CMD_DRIVER_OUTPUT_CONTROL);
-  sendData((HEIGHT - 1) % 256);  // gates A0..A7 (low byte)
-  sendData((HEIGHT - 1) / 256);  // gates A8..A9 (high byte)
-  sendData(0x02);                // SM=1 (interlaced), TB=0
+  sendData(driverOutput, sizeof(driverOutput));
 
   // Border waveform control
   sendCommand(CMD_BORDER_WAVEFORM);
@@ -275,6 +272,14 @@ void EInkDisplay::setRamArea(const uint16_t x, uint16_t y, uint16_t w, uint16_t 
 
   // Reverse Y coordinate (gates are reversed on this display)
   y = DISPLAY_HEIGHT - y - h;
+  const uint16_t xEnd = x + w - 1;
+  const uint16_t yStart = y + h - 1;
+  const uint8_t ramXRange[] = {
+      static_cast<uint8_t>(x & 0xFF), static_cast<uint8_t>(x >> 8), static_cast<uint8_t>(xEnd & 0xFF), static_cast<uint8_t>(xEnd >> 8)};
+  const uint8_t ramYRange[] = {
+      static_cast<uint8_t>(yStart & 0xFF), static_cast<uint8_t>(yStart >> 8), static_cast<uint8_t>(y & 0xFF), static_cast<uint8_t>(y >> 8)};
+  const uint8_t ramXCounter[] = {static_cast<uint8_t>(x & 0xFF), static_cast<uint8_t>(x >> 8)};
+  const uint8_t ramYCounter[] = {static_cast<uint8_t>(yStart & 0xFF), static_cast<uint8_t>(yStart >> 8)};
 
   // Set data entry mode (X increment, Y decrement for reversed gates)
   sendCommand(CMD_DATA_ENTRY_MODE);
@@ -282,27 +287,19 @@ void EInkDisplay::setRamArea(const uint16_t x, uint16_t y, uint16_t w, uint16_t 
 
   // Set RAM X address range (start, end) - X is in PIXELS
   sendCommand(CMD_SET_RAM_X_RANGE);
-  sendData(x % 256);            // start low byte
-  sendData(x / 256);            // start high byte
-  sendData((x + w - 1) % 256);  // end low byte
-  sendData((x + w - 1) / 256);  // end high byte
+  sendData(ramXRange, sizeof(ramXRange));
 
   // Set RAM Y address range (start, end) - Y is in PIXELS
   sendCommand(CMD_SET_RAM_Y_RANGE);
-  sendData((y + h - 1) % 256);  // start low byte
-  sendData((y + h - 1) / 256);  // start high byte
-  sendData(y % 256);            // end low byte
-  sendData(y / 256);            // end high byte
+  sendData(ramYRange, sizeof(ramYRange));
 
   // Set RAM X address counter - X is in PIXELS
   sendCommand(CMD_SET_RAM_X_COUNTER);
-  sendData(x % 256);  // low byte
-  sendData(x / 256);  // high byte
+  sendData(ramXCounter, sizeof(ramXCounter));
 
   // Set RAM Y address counter - Y is in PIXELS
   sendCommand(CMD_SET_RAM_Y_COUNTER);
-  sendData((y + h - 1) % 256);  // low byte
-  sendData((y + h - 1) / 256);  // high byte
+  sendData(ramYCounter, sizeof(ramYCounter));
 }
 
 void EInkDisplay::clearScreen(const uint8_t color) const {
@@ -316,26 +313,27 @@ void EInkDisplay::drawImage(const uint8_t* imageData, const uint16_t x, const ui
     return;
   }
 
-  // Calculate bytes per line for the image
+  const uint16_t xByte = x / 8;
   const uint16_t imageWidthBytes = w / 8;
+  if (xByte >= DISPLAY_WIDTH_BYTES || y >= DISPLAY_HEIGHT || imageWidthBytes == 0 || h == 0) {
+    return;
+  }
+
+  const uint16_t rowsToCopy = (y + h > DISPLAY_HEIGHT) ? (DISPLAY_HEIGHT - y) : h;
+  const uint16_t colsToCopy = (xByte + imageWidthBytes > DISPLAY_WIDTH_BYTES) ? (DISPLAY_WIDTH_BYTES - xByte) : imageWidthBytes;
 
   // Copy image data to frame buffer
-  for (uint16_t row = 0; row < h; row++) {
-    const uint16_t destY = y + row;
-    if (destY >= DISPLAY_HEIGHT)
-      break;
-
-    const uint16_t destOffset = destY * DISPLAY_WIDTH_BYTES + (x / 8);
+  for (uint16_t row = 0; row < rowsToCopy; row++) {
+    const uint16_t destOffset = (y + row) * DISPLAY_WIDTH_BYTES + xByte;
     const uint16_t srcOffset = row * imageWidthBytes;
+    uint8_t* dest = &frameBuffer[destOffset];
+    const uint8_t* src = &imageData[srcOffset];
 
-    for (uint16_t col = 0; col < imageWidthBytes; col++) {
-      if ((x / 8 + col) >= DISPLAY_WIDTH_BYTES)
-        break;
-
-      if (fromProgmem) {
-        frameBuffer[destOffset + col] = pgm_read_byte(&imageData[srcOffset + col]);
-      } else {
-        frameBuffer[destOffset + col] = imageData[srcOffset + col];
+    if (!fromProgmem) {
+      memcpy(dest, src, colsToCopy);
+    } else {
+      for (uint16_t col = 0; col < colsToCopy; col++) {
+        dest[col] = pgm_read_byte(&src[col]);
       }
     }
   }
@@ -347,32 +345,33 @@ void EInkDisplay::drawImage(const uint8_t* imageData, const uint16_t x, const ui
 void EInkDisplay::drawImageTransparent(const uint8_t* imageData, const uint16_t x, const uint16_t y, const uint16_t w, const uint16_t h,
                                      const bool fromProgmem) const {
   if (!frameBuffer) {
-    Serial.printf("[%lu]   ERROR: Frame buffer not allocated!\n", millis());
+    if (Serial) Serial.printf("[%lu]   ERROR: Frame buffer not allocated!\n", millis());
     return;
   }
 
-  // Calculate bytes per line for the image
+  const uint16_t xByte = x / 8;
   const uint16_t imageWidthBytes = w / 8;
+  if (xByte >= DISPLAY_WIDTH_BYTES || y >= DISPLAY_HEIGHT || imageWidthBytes == 0 || h == 0) {
+    return;
+  }
+
+  const uint16_t rowsToCopy = (y + h > DISPLAY_HEIGHT) ? (DISPLAY_HEIGHT - y) : h;
+  const uint16_t colsToCopy = (xByte + imageWidthBytes > DISPLAY_WIDTH_BYTES) ? (DISPLAY_WIDTH_BYTES - xByte) : imageWidthBytes;
 
   // Copy only black pixels to frame buffer
-  for (uint16_t row = 0; row < h; row++) {
-    const uint16_t destY = y + row;
-    if (destY >= DISPLAY_HEIGHT)
-      break;
-
-    const uint16_t destOffset = destY * DISPLAY_WIDTH_BYTES + (x / 8);
+  for (uint16_t row = 0; row < rowsToCopy; row++) {
+    const uint16_t destOffset = (y + row) * DISPLAY_WIDTH_BYTES + xByte;
     const uint16_t srcOffset = row * imageWidthBytes;
+    uint8_t* dest = &frameBuffer[destOffset];
+    const uint8_t* src = &imageData[srcOffset];
 
-    for (uint16_t col = 0; col < imageWidthBytes; col++) {
-      if ((x / 8 + col) >= DISPLAY_WIDTH_BYTES)
-        break;
-
-      uint8_t srcByte = fromProgmem ? pgm_read_byte(&imageData[srcOffset + col]) : imageData[srcOffset + col];
-      frameBuffer[destOffset + col] &= srcByte;
+    for (uint16_t col = 0; col < colsToCopy; col++) {
+      const uint8_t srcByte = fromProgmem ? pgm_read_byte(&src[col]) : src[col];
+      dest[col] &= srcByte;
     }
   }
 
-  Serial.printf("[%lu]   Transparent image drawn to frame buffer\n", millis());
+  if (Serial) Serial.printf("[%lu]   Transparent image drawn to frame buffer\n", millis());
 }
 
 void EInkDisplay::writeRamBuffer(uint8_t ramBuffer, const uint8_t* data, uint32_t size) {
@@ -457,9 +456,8 @@ void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
   setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 
   if (mode != FAST_REFRESH) {
-    // For full refresh, write to both buffers before refresh
+    // For full/half refresh RED RAM is bypassed, so writing BW only is sufficient.
     writeRamBuffer(CMD_WRITE_RAM_BW, frameBuffer, BUFFER_SIZE);
-    writeRamBuffer(CMD_WRITE_RAM_RED, frameBuffer, BUFFER_SIZE);
   } else {
     // For fast refresh, write to BW buffer only
     writeRamBuffer(CMD_WRITE_RAM_BW, frameBuffer, BUFFER_SIZE);
@@ -514,39 +512,38 @@ void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
     grayscaleRevert();
   }
 
-  // Calculate window buffer size
+  // Calculate window transfer size
   const uint16_t windowWidthBytes = w / 8;
-  const uint32_t windowBufferSize = windowWidthBytes * h;
+  const uint32_t windowTransferBytes = windowWidthBytes * h;
+  const uint16_t xByte = x / 8;
 
-  if (Serial) Serial.printf("[%lu]   Window buffer size: %lu bytes (%d x %d pixels)\n", millis(), windowBufferSize, w, h);
+  if (Serial) Serial.printf("[%lu]   Window transfer size: %lu bytes (%d x %d pixels)\n", millis(), windowTransferBytes, w, h);
 
-  // Allocate temporary buffer on stack
-  std::vector<uint8_t> windowBuffer(windowBufferSize);
+  auto writeWindowFromBuffer = [&](const uint8_t ramBuffer, const uint8_t* sourceBuffer) {
+    SPI.beginTransaction(spiSettings);
+    digitalWrite(_dc, LOW);  // Command mode
+    digitalWrite(_cs, LOW);  // Select chip
+    SPI.transfer(ramBuffer);
+    digitalWrite(_dc, HIGH);  // Data mode
 
-  // Extract window region from frame buffer
-  for (uint16_t row = 0; row < h; row++) {
-    const uint16_t srcY = y + row;
-    const uint16_t srcOffset = srcY * DISPLAY_WIDTH_BYTES + (x / 8);
-    const uint16_t dstOffset = row * windowWidthBytes;
-    memcpy(&windowBuffer[dstOffset], &frameBuffer[srcOffset], windowWidthBytes);
-  }
+    for (uint16_t row = 0; row < h; row++) {
+      const uint32_t srcOffset = static_cast<uint32_t>(y + row) * DISPLAY_WIDTH_BYTES + xByte;
+      SPI.writeBytes(&sourceBuffer[srcOffset], windowWidthBytes);
+    }
+
+    digitalWrite(_cs, HIGH);  // Deselect chip
+    SPI.endTransaction();
+  };
 
   // Configure RAM area for window
   setRamArea(x, y, w, h);
 
   // Write to BW RAM (current frame)
-  writeRamBuffer(CMD_WRITE_RAM_BW, windowBuffer.data(), windowBufferSize);
+  writeWindowFromBuffer(CMD_WRITE_RAM_BW, frameBuffer);
 
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-  // Dual buffer: Extract window from frameBufferActive (previous frame)
-  std::vector<uint8_t> previousWindowBuffer(windowBufferSize);
-  for (uint16_t row = 0; row < h; row++) {
-    const uint16_t srcY = y + row;
-    const uint16_t srcOffset = srcY * DISPLAY_WIDTH_BYTES + (x / 8);
-    const uint16_t dstOffset = row * windowWidthBytes;
-    memcpy(&previousWindowBuffer[dstOffset], &frameBufferActive[srcOffset], windowWidthBytes);
-  }
-  writeRamBuffer(CMD_WRITE_RAM_RED, previousWindowBuffer.data(), windowBufferSize);
+  // Dual buffer: stream previous frame from frameBufferActive.
+  writeWindowFromBuffer(CMD_WRITE_RAM_RED, frameBufferActive);
 #endif
 
   // Perform fast refresh
@@ -555,7 +552,7 @@ void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
   // Post-refresh: Sync RED RAM with current window (for next fast refresh)
   setRamArea(x, y, w, h);
-  writeRamBuffer(CMD_WRITE_RAM_RED, windowBuffer.data(), windowBufferSize);
+  writeWindowFromBuffer(CMD_WRITE_RAM_RED, frameBuffer);
 #endif
 
   if (Serial) Serial.printf("[%lu]   Window display complete\n", millis());
@@ -631,20 +628,23 @@ void EInkDisplay::setCustomLUT(const bool enabled, const unsigned char* lutData)
   if (enabled) {
     if (Serial) Serial.printf("[%lu]   Loading custom LUT...\n", millis());
 
+    uint8_t lutWaveform[105];
+    for (uint16_t i = 0; i < sizeof(lutWaveform); i++) {
+      lutWaveform[i] = pgm_read_byte(&lutData[i]);
+    }
+
     // Load custom LUT (first 105 bytes: VS + TP/RP + frame rate)
     sendCommand(CMD_WRITE_LUT);
-    for (uint16_t i = 0; i < 105; i++) {
-      sendData(pgm_read_byte(&lutData[i]));
-    }
+    sendData(lutWaveform, sizeof(lutWaveform));
 
     // Set voltage values from bytes 105-109
     sendCommand(CMD_GATE_VOLTAGE);  // VGH
     sendData(pgm_read_byte(&lutData[105]));
 
+    const uint8_t sourceVoltages[] = {
+        pgm_read_byte(&lutData[106]), pgm_read_byte(&lutData[107]), pgm_read_byte(&lutData[108])};
     sendCommand(CMD_SOURCE_VOLTAGE);         // VSH1, VSH2, VSL
-    sendData(pgm_read_byte(&lutData[106]));  // VSH1
-    sendData(pgm_read_byte(&lutData[107]));  // VSH2
-    sendData(pgm_read_byte(&lutData[108]));  // VSL
+    sendData(sourceVoltages, sizeof(sourceVoltages));
 
     sendCommand(CMD_WRITE_VCOM);  // VCOM
     sendData(pgm_read_byte(&lutData[109]));
