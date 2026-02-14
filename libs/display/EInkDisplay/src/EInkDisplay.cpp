@@ -646,6 +646,17 @@ bool EInkDisplay::displayBufferAsync(RefreshMode mode, const bool turnOffScreen)
 void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const bool turnOffScreen) {
   if (Serial) Serial.printf("[%lu]   Displaying window at (%d,%d) size (%dx%d)\n", millis(), x, y, w, h);
 
+  while (!pollRefreshComplete()) {
+    delay(1);
+  }
+  if (isBusy()) {
+    waitWhileBusy(" pre-displayWindow busy");
+    if (isBusy()) {
+      if (Serial) Serial.printf("[%lu]   ERROR: Panel still busy before displayWindow\n", millis());
+      return;
+    }
+  }
+
   // Validate bounds
   if (x + w > DISPLAY_WIDTH || y + h > DISPLAY_HEIGHT) {
     if (Serial) Serial.printf("[%lu]   ERROR: Window bounds exceed display dimensions!\n", millis());
@@ -663,6 +674,13 @@ void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
     return;
   }
 
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  if (!frameBufferActive) {
+    if (Serial) Serial.printf("[%lu]   ERROR: Active frame buffer not allocated in dual buffer mode!\n", millis());
+    return;
+  }
+#endif
+
   // displayWindow is not supported while the rest of the screen has grayscale content, revert it
   if (inGrayscaleMode) {
     inGrayscaleMode = false;
@@ -677,6 +695,8 @@ void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
   if (Serial) Serial.printf("[%lu]   Window transfer size: %lu bytes (%d x %d pixels)\n", millis(), windowTransferBytes, w, h);
 
   auto writeWindowFromBuffer = [&](const uint8_t ramBuffer, const uint8_t* sourceBuffer) {
+    // reset window ranges and address counters before each ram write
+    setRamArea(x, y, w, h);
     SPI.beginTransaction(spiSettings);
     digitalWrite(_dc, LOW);  // Command mode
     digitalWrite(_cs, LOW);  // Select chip
@@ -710,6 +730,15 @@ void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
   // Post-refresh: Sync RED RAM with current window (for next fast refresh)
   setRamArea(x, y, w, h);
   writeWindowFromBuffer(CMD_WRITE_RAM_RED, frameBuffer);
+#endif
+  // post-refresh: sync RED RAM with current window
+  writeWindowFromBuffer(CMD_WRITE_RAM_RED, frameBuffer);
+
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  for (uint16_t row = 0; row < h; row++) {
+    const uint32_t srcOffset = static_cast<uint32_t>(y + row) * DISPLAY_WIDTH_BYTES + xByte;
+    memcpy(&frameBufferActive[srcOffset], &frameBuffer[srcOffset], windowWidthBytes);
+  }
 #endif
 
   if (Serial) Serial.printf("[%lu]   Window display complete\n", millis());
