@@ -529,17 +529,20 @@ void EInkDisplay::copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* 
   writeRamBuffer(CMD_WRITE_RAM_RED, msbBuffer, BUFFER_SIZE);
 }
 
-#ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
-/**
- * In single buffer mode, this should be called with the previously written BW buffer
- * to reconstruct the RED buffer for proper differential fast refreshes following a
- * grayscale display.
- */
 void EInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
+#ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  /**
+   * In single buffer mode, this should be called with the previously written BW buffer
+   * to reconstruct the RED buffer for proper differential fast refreshes following a
+   * grayscale display.
+   */
   setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
   writeRamBuffer(CMD_WRITE_RAM_RED, bwBuffer, BUFFER_SIZE);
-}
+#else
+  // In dual buffer mode, keep previous-frame backup in sync with the restored BW frame.
+  memcpy(frameBufferActive, bwBuffer, BUFFER_SIZE);
 #endif
+}
 
 void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
   while (!pollRefreshComplete()) {
@@ -565,6 +568,61 @@ void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
     inGrayscaleMode = false;
     grayscaleRevert();
   }
+
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  // FAST refresh can use a windowed update when only a small region changed.
+  // Compare current framebuffer against previous-frame backup (frameBufferActive).
+  if (mode == FAST_REFRESH) {
+    uint16_t minDiffXByte = DISPLAY_WIDTH_BYTES;
+    uint16_t maxDiffXByte = 0;
+    uint16_t minDiffY = DISPLAY_HEIGHT;
+    uint16_t maxDiffY = 0;
+    bool hasDiff = false;
+
+    for (uint16_t y = 0; y < DISPLAY_HEIGHT; y++) {
+      const uint32_t rowOffset = static_cast<uint32_t>(y) * DISPLAY_WIDTH_BYTES;
+      for (uint16_t xByte = 0; xByte < DISPLAY_WIDTH_BYTES; xByte++) {
+        const uint32_t idx = rowOffset + xByte;
+        if (frameBuffer[idx] == frameBufferActive[idx]) {
+          continue;
+        }
+        hasDiff = true;
+        if (xByte < minDiffXByte) minDiffXByte = xByte;
+        if (xByte > maxDiffXByte) maxDiffXByte = xByte;
+        if (y < minDiffY) minDiffY = y;
+        if (y > maxDiffY) maxDiffY = y;
+      }
+    }
+
+    if (!hasDiff) {
+      if (Serial) Serial.printf("[%lu]   FAST refresh skipped (no framebuffer diff)\n", millis());
+      // Honor explicit power-down requests even when the image did not change.
+      if (turnOffScreen) {
+        refreshDisplay(mode, true);
+      }
+      return;
+    }
+
+    const uint16_t windowX = static_cast<uint16_t>(minDiffXByte * 8);
+    const uint16_t windowY = minDiffY;
+    const uint16_t windowW = static_cast<uint16_t>((maxDiffXByte - minDiffXByte + 1) * 8);
+    const uint16_t windowH = static_cast<uint16_t>(maxDiffY - minDiffY + 1);
+
+    const uint32_t windowBytes = static_cast<uint32_t>(windowW / 8) * windowH;
+    constexpr uint32_t fullFastTransferBytes = BUFFER_SIZE * 2;  // BW + RED writes in full fast path
+    const uint32_t windowTransferEstimate = windowBytes * 3;     // BW + RED pre-refresh + RED post-refresh sync
+
+    if (windowTransferEstimate < fullFastTransferBytes) {
+      Serial.printf("[%lu]   FAST refresh using window (%u,%u %ux%u), transfer est %lu vs full %lu\n", millis(),
+                    windowX, windowY, windowW, windowH, windowTransferEstimate, fullFastTransferBytes);
+      displayWindow(windowX, windowY, windowW, windowH, turnOffScreen);
+      return;
+    } else {
+      Serial.printf("[%lu]   FAST refresh using full screen update, window transfer est %lu vs full %lu\n", millis(),
+                    windowTransferEstimate, fullFastTransferBytes);
+    }
+  }
+#endif
 
   // Set up full screen RAM area
   setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
@@ -715,13 +773,15 @@ void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
   // Configure RAM area for window
   setRamArea(x, y, w, h);
 
-  // Write to BW RAM (current frame)
-  writeWindowFromBuffer(CMD_WRITE_RAM_BW, frameBuffer);
-
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-  // Dual buffer: stream previous frame from frameBufferActive.
-  writeWindowFromBuffer(CMD_WRITE_RAM_RED, frameBufferActive);
+  // In dual buffer mode, preload full RED RAM with previous frame.
+  // This keeps unchanged regions stable even if controller update driving is not strictly window-limited.
+  setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  writeRamBuffer(CMD_WRITE_RAM_RED, frameBufferActive, BUFFER_SIZE);
 #endif
+
+  // Write to BW RAM (current frame) for the window region only.
+  writeWindowFromBuffer(CMD_WRITE_RAM_BW, frameBuffer);
 
   // Perform fast refresh
   refreshDisplay(FAST_REFRESH, turnOffScreen);
